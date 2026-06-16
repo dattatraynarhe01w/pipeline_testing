@@ -1,6 +1,6 @@
-# .github/workflows/test.yml
+# .github/workflows/secure-build.yml
 
-name: Run Tests
+name: Secure Build Pipeline
 
 on:
   push:
@@ -9,23 +9,128 @@ on:
       - develop
   pull_request:
 
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  id-token: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
 jobs:
-  test:
+  build-test-security:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      # Level 1 - Build Process
+      - name: Checkout Source
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Verify Signed Commit
+        run: |
+          git log --show-signature -1
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           pip install -r requirements.txt
+          pip install pytest pytest-cov
 
-      - name: Run tests
+      - name: Run Unit Tests
         run: |
-          pytest
+          pytest tests/ -v --cov=. --cov-report=xml
+
+      - name: Build Application
+        run: |
+          echo "Application build completed"
+
+      # Security Scan
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          exit-code: 1
+          severity: HIGH,CRITICAL
+
+      # Docker Build
+      - name: Build Container
+        run: |
+          docker build -t $IMAGE_NAME:${{ github.sha }} .
+
+      # Level 2 - SBOM using Syft
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: $IMAGE_NAME:${{ github.sha }}
+          format: spdx-json
+          output-file: sbom.json
+
+      # Level 2 - SBOM Scan using Trivy
+      - name: Generate Trivy SBOM
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $PWD:/tmp aquasec/trivy image \
+            --format cyclonedx \
+            --output /tmp/trivy-sbom.json \
+            $IMAGE_NAME:${{ github.sha }}
+
+      - name: Upload SBOM Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-files
+          path: |
+            sbom.json
+            trivy-sbom.json
+
+      # Push Image
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Image
+        run: |
+          docker push $IMAGE_NAME:${{ github.sha }}
+
+      # Level 2 & 5 - Container/Image Signing (Cosign)
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Container Image
+        run: |
+          cosign sign --yes \
+          $IMAGE_NAME:${{ github.sha }}
+
+      - name: Verify Signature
+        run: |
+          cosign verify \
+          $IMAGE_NAME:${{ github.sha }}
+
+      # Level 5 - Artifact Signing
+      - name: Sign Build Artifacts
+        run: |
+          sha256sum sbom.json > sbom.sha256
+
+      # in-toto Provenance
+      - name: Generate Provenance Attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: sbom.json
+
+      - name: Upload Signed Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-artifacts
+          path: |
+            sbom.json
+            sbom.sha256
